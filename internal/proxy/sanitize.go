@@ -12,14 +12,21 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
 )
 
-var builtinSearchToolTypes = map[string]bool{
+// builtinServerToolTypes are OpenAI/Grok server-side tools (not client functions).
+// They must be preserved end-to-end so web search / code interpreter work.
+var builtinServerToolTypes = map[string]bool{
 	"web_search":         true,
 	"web_search_preview": true,
 	"live_search":        true,
 	"x_search":           true,
+	"code_interpreter":   true,
+	"code_execution":     true,
 	"builtin_function":   true,
 	"builtin":            true,
 }
+
+// deprecated alias for callers/tests that still reference the old name.
+var builtinSearchToolTypes = builtinServerToolTypes
 
 var unsupportedUpstreamParams = map[string]bool{
 	"presence_penalty":  true,
@@ -50,11 +57,14 @@ func SanitizeUpstreamBody(body map[string]any) map[string]any {
 	}
 	clampFloat(out, "temperature", 0, 2)
 	clampFloat(out, "top_p", 0, 1)
-	for _, key := range []string{"max_tokens", "max_completion_tokens"} {
+	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_tool_calls"} {
 		if value, ok := out[key]; ok && !positiveInt(value) {
 			delete(out, key)
 		}
 	}
+	normalizeStopField(out)
+	normalizeSeedField(out)
+	normalizeResponseFormatField(out)
 	normalizeToolsField(out)
 	normalizeFunctionsField(out)
 	normalizeToolChoiceField(out)
@@ -62,6 +72,7 @@ func SanitizeUpstreamBody(body map[string]any) map[string]any {
 		delete(out, "tool_choice")
 		delete(out, "function_call")
 		delete(out, "parallel_tool_calls")
+		delete(out, "max_tool_calls")
 	}
 	return out
 }
@@ -378,28 +389,41 @@ func normalizeToolsField(body map[string]any) {
 		delete(body, "tools")
 		return
 	}
-	cleaned := make([]map[string]any, 0, len(items))
+	functions := make([]map[string]any, 0, len(items))
+	builtins := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		tool, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
 		toolType := strings.ToLower(strings.TrimSpace(stringFromAny(firstNonNil(tool["type"], "function"))))
-		if builtinSearchToolTypes[toolType] {
+		if builtinServerToolTypes[toolType] {
+			// Preserve server-side tools (web_search, code_interpreter, x_search).
+			entry := map[string]any{"type": toolType}
+			for _, key := range []string{"container", "file_ids", "vector_store_ids", "filters", "user_location"} {
+				if tool[key] != nil {
+					entry[key] = tool[key]
+				}
+			}
+			builtins = append(builtins, entry)
 			continue
 		}
 		if toolType != "function" && tool["type"] != nil {
 			continue
 		}
 		if normalized := normalizeFunctionTool(tool); normalized != nil {
-			cleaned = append(cleaned, normalized)
+			functions = append(functions, normalized)
 		}
 	}
-	if len(cleaned) == 0 {
+	if len(functions) == 0 && len(builtins) == 0 {
 		delete(body, "tools")
 		return
 	}
-	sort.SliceStable(cleaned, func(i, j int) bool { return toolSortKey(cleaned[i]) < toolSortKey(cleaned[j]) })
+	sort.SliceStable(functions, func(i, j int) bool { return toolSortKey(functions[i]) < toolSortKey(functions[j]) })
+	sort.SliceStable(builtins, func(i, j int) bool {
+		return stringFromAny(builtins[i]["type"]) < stringFromAny(builtins[j]["type"])
+	})
+	cleaned := append(functions, builtins...)
 	body["tools"] = mapsToAny(cleaned)
 }
 
@@ -450,10 +474,18 @@ func normalizeToolChoiceField(body map[string]any) {
 	case map[string]any:
 		choiceType := strings.ToLower(strings.TrimSpace(stringFromAny(firstNonNil(value["type"], "function"))))
 		switch {
-		case builtinSearchToolTypes[choiceType]:
-			body["tool_choice"] = "auto"
+		case builtinServerToolTypes[choiceType]:
+			body["tool_choice"] = map[string]any{"type": choiceType}
 		case choiceType == "any" || choiceType == "tool":
-			body["tool_choice"] = "required"
+			name := stringFromAny(value["name"])
+			if name == "" {
+				body["tool_choice"] = "required"
+			} else {
+				body["tool_choice"] = map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": name},
+				}
+			}
 		case choiceType == "auto" || choiceType == "none" || choiceType == "required":
 			body["tool_choice"] = choiceType
 		case choiceType != "function":
@@ -465,11 +497,113 @@ func normalizeToolChoiceField(body map[string]any) {
 				name = stringFromAny(fn["name"])
 			}
 			if name != "" {
-				body["tool_choice"] = "required"
+				body["tool_choice"] = map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": name},
+				}
 			} else {
 				body["tool_choice"] = "auto"
 			}
 		}
+	}
+}
+
+func normalizeStopField(body map[string]any) {
+	raw, exists := body["stop"]
+	if !exists || raw == nil {
+		return
+	}
+	switch value := raw.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			delete(body, "stop")
+			return
+		}
+		body["stop"] = []any{value}
+	case []any:
+		out := make([]any, 0, len(value))
+		for _, item := range value {
+			text := strings.TrimSpace(stringFromAny(item))
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		if len(out) == 0 {
+			delete(body, "stop")
+			return
+		}
+		body["stop"] = out
+	case []string:
+		out := make([]any, 0, len(value))
+		for _, item := range value {
+			if text := strings.TrimSpace(item); text != "" {
+				out = append(out, text)
+			}
+		}
+		if len(out) == 0 {
+			delete(body, "stop")
+			return
+		}
+		body["stop"] = out
+	default:
+		delete(body, "stop")
+	}
+}
+
+func normalizeSeedField(body map[string]any) {
+	raw, exists := body["seed"]
+	if !exists || raw == nil {
+		return
+	}
+	switch v := raw.(type) {
+	case int, int64, float64, json.Number:
+		body["seed"] = v
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			delete(body, "seed")
+			return
+		}
+		body["seed"] = n
+	default:
+		delete(body, "seed")
+	}
+}
+
+// normalizeResponseFormatField keeps OpenAI json_object / json_schema shapes.
+// Upstream Grok Responses maps this to text.format in chatToResponsesPayload.
+func normalizeResponseFormatField(body map[string]any) {
+	raw, exists := body["response_format"]
+	if !exists || raw == nil {
+		return
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		delete(body, "response_format")
+		return
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringFromAny(obj["type"])))
+	switch typ {
+	case "text", "json_object":
+		body["response_format"] = map[string]any{"type": typ}
+	case "json_schema":
+		schema := firstNonNil(obj["json_schema"], obj["schema"])
+		if schema == nil {
+			delete(body, "response_format")
+			return
+		}
+		out := map[string]any{"type": "json_schema"}
+		if obj["json_schema"] != nil {
+			out["json_schema"] = obj["json_schema"]
+		} else {
+			out["json_schema"] = schema
+		}
+		if name := stringFromAny(obj["name"]); name != "" {
+			out["name"] = name
+		}
+		body["response_format"] = out
+	default:
+		delete(body, "response_format")
 	}
 }
 

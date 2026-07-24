@@ -396,3 +396,139 @@ func TestExtractConvIDClaudeCodeUser(t *testing.T) {
 		t.Fatalf("metadata session: %q", id3)
 	}
 }
+
+
+func TestChatToResponsesPayloadMatrixFields(t *testing.T) {
+	body := chatToResponsesPayload(map[string]any{
+		"messages": []any{map[string]any{"role": "system", "content": "You are useful."}, map[string]any{"role": "user", "content": "hi"}},
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}},
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "code_interpreter"},
+		},
+		"tool_choice":         map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}},
+		"parallel_tool_calls": false,
+		"max_tool_calls":      2,
+		"stop":                []any{"END"},
+		"seed":                7,
+		"top_p":               0.5,
+		"response_format":     map[string]any{"type": "json_object"},
+		"reasoning_effort":    "auto",
+		"max_tokens":          128,
+	}, "grok-4.5")
+
+	if body["top_p"] != 0.5 && body["top_p"] != float64(0.5) {
+		t.Fatalf("top_p=%#v", body["top_p"])
+	}
+	if body["max_tool_calls"] != 2 && body["max_tool_calls"] != float64(2) {
+		t.Fatalf("max_tool_calls=%#v", body["max_tool_calls"])
+	}
+	if body["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls=%#v", body["parallel_tool_calls"])
+	}
+	if body["max_output_tokens"] != 128 && body["max_output_tokens"] != float64(128) {
+		t.Fatalf("max_output_tokens=%#v", body["max_output_tokens"])
+	}
+	// response_format -> text.format
+	textObj, _ := body["text"].(map[string]any)
+	format, _ := textObj["format"].(map[string]any)
+	if format["type"] != "json_object" {
+		t.Fatalf("text.format=%#v", body["text"])
+	}
+	// specific tool_choice converted to Responses flat shape {type,name}
+	tc, _ := body["tool_choice"].(map[string]any)
+	if tc["type"] != "function" || tc["name"] != "lookup" {
+		t.Fatalf("tool_choice=%#v (want Responses flat {type:function,name:lookup})", body["tool_choice"])
+	}
+	if _, nested := tc["function"]; nested {
+		t.Fatalf("nested chat tool_choice must not reach /responses: %#v", body["tool_choice"])
+	}
+	// seed/stop must NOT be forwarded to /responses (chat-only; can 400 cli-proxy)
+	if _, ok := body["seed"]; ok {
+		t.Fatalf("seed should not be forwarded to responses: %#v", body["seed"])
+	}
+	if _, ok := body["stop"]; ok {
+		t.Fatalf("stop should not be forwarded to responses: %#v", body["stop"])
+	}
+	// tools include builtins + function (plus default x_search if not already present)
+	tools, _ := body["tools"].([]any)
+	found := map[string]bool{}
+	for _, item := range tools {
+		m, _ := item.(map[string]any)
+		if m == nil {
+			continue
+		}
+		typ, _ := m["type"].(string)
+		if typ == "function" {
+			found["function:"+firstString(m, "name")] = true
+		} else {
+			found[typ] = true
+		}
+	}
+	for _, need := range []string{"web_search", "code_interpreter", "function:lookup", "x_search"} {
+		if !found[need] {
+			t.Fatalf("missing tool %s in %#v", need, found)
+		}
+	}
+	// system becomes developer input
+	input, _ := body["input"].([]any)
+	if len(input) < 2 {
+		t.Fatalf("input=%#v", input)
+	}
+}
+
+func TestResponseFormatToTextFormatJSONSchema(t *testing.T) {
+	tf := responseFormatToTextFormat(map[string]any{
+		"type": "json_schema",
+		"json_schema": map[string]any{
+			"name":   "answer",
+			"strict": true,
+			"schema": map[string]any{"type": "object", "properties": map[string]any{"ok": map[string]any{"type": "boolean"}}},
+		},
+	})
+	if tf["type"] != "json_schema" || tf["name"] != "answer" || tf["strict"] != true {
+		t.Fatalf("tf=%#v", tf)
+	}
+	schema, _ := tf["schema"].(map[string]any)
+	if schema["type"] != "object" {
+		t.Fatalf("schema=%#v", schema)
+	}
+}
+
+
+func TestConvertToolChoiceToResponses(t *testing.T) {
+	// Chat nested → Responses flat
+	got := convertToolChoiceToResponses(map[string]any{
+		"type":     "function",
+		"function": map[string]any{"name": "lookup"},
+	})
+	m, _ := got.(map[string]any)
+	if m["type"] != "function" || m["name"] != "lookup" {
+		t.Fatalf("nested chat → %#v", got)
+	}
+	if _, ok := m["function"]; ok {
+		t.Fatalf("nested function key leaked: %#v", got)
+	}
+
+	// Already flat Responses shape stays flat
+	got = convertToolChoiceToResponses(map[string]any{"type": "function", "name": "X"})
+	m, _ = got.(map[string]any)
+	if m["name"] != "X" {
+		t.Fatalf("flat %#v", got)
+	}
+
+	// strings
+	if convertToolChoiceToResponses("required") != "required" {
+		t.Fatalf("required")
+	}
+	if convertToolChoiceToResponses("any") != "required" {
+		t.Fatalf("any")
+	}
+
+	// builtin
+	got = convertToolChoiceToResponses(map[string]any{"type": "web_search"})
+	m, _ = got.(map[string]any)
+	if m["type"] != "web_search" {
+		t.Fatalf("builtin %#v", got)
+	}
+}

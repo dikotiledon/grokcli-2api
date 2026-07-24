@@ -1,0 +1,16 @@
+[project]
+name = "grok2api-client"
+version = "1.0.0"
+description = "Full-featured OpenAI-compatible client for grokcli-2api (feature matrix)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+vision = ["pillow>=10.0.0"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["grok2api_client*"]

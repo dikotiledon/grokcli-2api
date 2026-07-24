@@ -49,16 +49,33 @@ func chatToResponsesPayload(body map[string]any, model string) map[string]any {
 		out["tools"] = tools
 	}
 	for _, key := range []string{
-		"temperature", "top_p", "tool_choice", "parallel_tool_calls",
+		"temperature", "top_p", "parallel_tool_calls",
 		"prompt_cache_key", "user", "instructions",
+		"max_tool_calls",
 	} {
 		if value, ok := body[key]; ok && value != nil {
 			out[key] = value
 		}
 	}
+	// tool_choice MUST be Responses-shaped. Chat nested
+	// {"type":"function","function":{"name":X}} causes cli-chat-proxy empty body
+	// (historical v1.9.62 bug). Responses wants {"type":"function","name":X}.
+	if tc := convertToolChoiceToResponses(body["tool_choice"]); tc != nil {
+		out["tool_choice"] = tc
+	}
+	// seed/stop are Chat Completions fields; Responses rejects unknown params on
+	// some cli-chat-proxy builds. Keep them only if already Responses-compatible
+	// (ignored client-side for matrix acceptance via sanitize, not forwarded raw).
+	// Intentionally NOT copied to /responses.
 	// Responses uses max_output_tokens; accept either name from chat body.
-	if value := firstNonNil(body["max_output_tokens"], body["max_tokens"]); value != nil {
+	if value := firstNonNil(body["max_output_tokens"], body["max_tokens"], body["max_completion_tokens"]); value != nil {
 		out["max_output_tokens"] = value
+	}
+	// OpenAI response_format -> Responses text.format (json_object / json_schema).
+	if rf, ok := body["response_format"].(map[string]any); ok && rf != nil {
+		if tf := responseFormatToTextFormat(rf); tf != nil {
+			out["text"] = map[string]any{"format": tf}
+		}
 	}
 	if effort, _ := body["reasoning_effort"].(string); strings.TrimSpace(effort) != "" {
 		out["reasoning"] = map[string]any{"effort": clampGrokEffort(effort), "summary": "auto"}
@@ -1057,4 +1074,115 @@ func clampGrokEffort(effort string) string {
 	}
 	// Unknown non-empty → medium (safe middle) rather than pass-through garbage.
 	return "medium"
+}
+
+
+// convertToolChoiceToResponses maps OpenAI Chat Completions tool_choice into
+// Responses API shape expected by cli-chat-proxy / Grok.
+//
+// Chat:
+//   "auto"|"none"|"required"
+//   {"type":"function","function":{"name":"X"}}
+//   {"type":"function","name":"X"}          (already flat)
+// Responses:
+//   "auto"|"none"|"required"
+//   {"type":"function","name":"X"}
+//   {"type":"web_search"} / other builtin types
+func convertToolChoiceToResponses(raw any) any {
+	if raw == nil {
+		return nil
+	}
+	switch value := raw.(type) {
+	case string:
+		choice := strings.ToLower(strings.TrimSpace(value))
+		switch choice {
+		case "auto", "none", "required":
+			return choice
+		case "any", "tool":
+			return "required"
+		case "":
+			return nil
+		default:
+			// Unknown string — drop rather than poison upstream.
+			return nil
+		}
+	case map[string]any:
+		choiceType := strings.ToLower(strings.TrimSpace(firstString(value, "type")))
+		if choiceType == "" {
+			choiceType = "function"
+		}
+		switch choiceType {
+		case "auto", "none", "required":
+			return choiceType
+		case "any", "tool":
+			// Anthropic any/tool without name → required; with name → specific fn.
+			name := firstString(value, "name")
+			if name == "" {
+				return "required"
+			}
+			return map[string]any{"type": "function", "name": name}
+		case "function":
+			// Prefer flat Responses name; fall back to nested Chat function.name.
+			name := firstString(value, "name")
+			if name == "" {
+				if fn, _ := value["function"].(map[string]any); fn != nil {
+					name = firstString(fn, "name")
+				}
+			}
+			if name == "" {
+				return "required"
+			}
+			return map[string]any{"type": "function", "name": name}
+		case "allowed_tools":
+			// Pass through Responses allowed_tools object as-is.
+			return value
+		default:
+			// Builtin tools: {"type":"web_search"} / code_interpreter / x_search …
+			return map[string]any{"type": choiceType}
+		}
+	default:
+		return nil
+	}
+}
+
+// responseFormatToTextFormat maps OpenAI chat response_format into Responses text.format.
+func responseFormatToTextFormat(rf map[string]any) map[string]any {
+	if rf == nil {
+		return nil
+	}
+	typ := strings.ToLower(strings.TrimSpace(firstString(rf, "type")))
+	switch typ {
+	case "json_object":
+		return map[string]any{"type": "json_object"}
+	case "json_schema":
+		out := map[string]any{"type": "json_schema"}
+		schemaBag, _ := rf["json_schema"].(map[string]any)
+		if schemaBag == nil {
+			if raw := rf["schema"]; raw != nil {
+				out["schema"] = raw
+			}
+			if name := firstString(rf, "name"); name != "" {
+				out["name"] = name
+			}
+			return out
+		}
+		if name := firstString(schemaBag, "name"); name != "" {
+			out["name"] = name
+		} else if name := firstString(rf, "name"); name != "" {
+			out["name"] = name
+		}
+		if schemaBag["schema"] != nil {
+			out["schema"] = schemaBag["schema"]
+		} else if schemaBag["properties"] != nil || schemaBag["type"] != nil {
+			out["schema"] = schemaBag
+		}
+		if schemaBag["strict"] != nil {
+			out["strict"] = schemaBag["strict"]
+		}
+		return out
+	case "text":
+		return map[string]any{"type": "text"}
+	default:
+		return nil
+	}
 }

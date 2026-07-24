@@ -31,17 +31,26 @@ func TestSanitizeUpstreamBodyNormalizesToolsAndToolChoice(t *testing.T) {
 	if _, ok := got["max_tokens"]; ok {
 		t.Fatalf("invalid max_tokens leaked: %#v", got)
 	}
-	if got["tool_choice"] != "required" {
+	tc, ok := got["tool_choice"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_choice = %#v (want specific function)", got["tool_choice"])
+	}
+	fn, _ := tc["function"].(map[string]any)
+	if tc["type"] != "function" || fn["name"] != "Bash" {
 		t.Fatalf("tool_choice = %#v", got["tool_choice"])
 	}
 	tools := got["tools"].([]any)
-	if len(tools) != 2 {
+	// function tools first (sorted), then preserved builtins (web_search_preview).
+	if len(tools) != 3 {
 		t.Fatalf("tools = %#v", tools)
 	}
 	first := tools[0].(map[string]any)["function"].(map[string]any)
 	second := tools[1].(map[string]any)["function"].(map[string]any)
 	if first["name"] != "Bash" || second["name"] != "Zed" {
 		t.Fatalf("tools not sorted/normalized: %#v", tools)
+	}
+	if tools[2].(map[string]any)["type"] != "web_search_preview" {
+		t.Fatalf("builtin web_search_preview not preserved: %#v", tools[2])
 	}
 	if _, ok := first["input_schema"]; ok {
 		t.Fatalf("input_schema leaked in function: %#v", first)
@@ -53,6 +62,7 @@ func TestSanitizeUpstreamBodyNormalizesToolsAndToolChoice(t *testing.T) {
 }
 
 func TestSanitizeUpstreamBodyDropsToolChoiceWithoutTools(t *testing.T) {
+	// Builtin-only tools still count as tools (web_search is preserved).
 	got := SanitizeUpstreamBody(map[string]any{
 		"messages":            []any{map[string]any{"role": "user", "content": "hi"}},
 		"tool_choice":         "required",
@@ -60,8 +70,88 @@ func TestSanitizeUpstreamBodyDropsToolChoiceWithoutTools(t *testing.T) {
 		"function_call":       map[string]any{"name": "legacy"},
 		"tools":               []any{map[string]any{"type": "web_search"}},
 	})
-	if got["tools"] != nil || got["tool_choice"] != nil || got["parallel_tool_calls"] != nil || got["function_call"] != nil {
-		t.Fatalf("tool-only fields leaked without tools: %#v", got)
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("web_search should be preserved: %#v", got["tools"])
+	}
+	if tools[0].(map[string]any)["type"] != "web_search" {
+		t.Fatalf("tools = %#v", tools)
+	}
+	if got["tool_choice"] != "required" {
+		t.Fatalf("tool_choice should remain with builtin tools: %#v", got["tool_choice"])
+	}
+
+	// Truly empty tools -> drop tool control fields.
+	got2 := SanitizeUpstreamBody(map[string]any{
+		"messages":            []any{map[string]any{"role": "user", "content": "hi"}},
+		"tool_choice":         "required",
+		"parallel_tool_calls": true,
+		"function_call":       map[string]any{"name": "legacy"},
+		"tools":               []any{},
+	})
+	if got2["tools"] != nil || got2["tool_choice"] != nil || got2["parallel_tool_calls"] != nil || got2["function_call"] != nil {
+		t.Fatalf("tool-only fields leaked without tools: %#v", got2)
+	}
+}
+
+func TestSanitizeUpstreamBodyPreservesMatrixFields(t *testing.T) {
+	got := SanitizeUpstreamBody(map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}},
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "code_interpreter"},
+		},
+		"tool_choice":         map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}},
+		"parallel_tool_calls": false,
+		"max_tool_calls":      3,
+		"stop":                []any{"END", "STOP"},
+		"seed":                42,
+		"top_p":               0.8,
+		"response_format":     map[string]any{"type": "json_object"},
+		"presence_penalty":    0.5,
+	})
+	if got["presence_penalty"] != nil {
+		t.Fatalf("presence_penalty should still be stripped: %#v", got)
+	}
+	if got["top_p"] != float64(0.8) {
+		t.Fatalf("top_p = %#v", got["top_p"])
+	}
+	if got["seed"] != 42 && got["seed"] != float64(42) && got["seed"] != int64(42) {
+		t.Fatalf("seed = %#v", got["seed"])
+	}
+	stop, _ := got["stop"].([]any)
+	if len(stop) != 2 {
+		t.Fatalf("stop = %#v", got["stop"])
+	}
+	if got["max_tool_calls"] != 3 && got["max_tool_calls"] != float64(3) {
+		t.Fatalf("max_tool_calls = %#v", got["max_tool_calls"])
+	}
+	if got["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls = %#v", got["parallel_tool_calls"])
+	}
+	rf, _ := got["response_format"].(map[string]any)
+	if rf["type"] != "json_object" {
+		t.Fatalf("response_format = %#v", got["response_format"])
+	}
+	tc, _ := got["tool_choice"].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if tc["type"] != "function" || fn["name"] != "lookup" {
+		t.Fatalf("tool_choice = %#v", got["tool_choice"])
+	}
+	tools, _ := got["tools"].([]any)
+	types := []string{}
+	for _, item := range tools {
+		m := item.(map[string]any)
+		if m["type"] == "function" {
+			types = append(types, "function:"+m["function"].(map[string]any)["name"].(string))
+		} else {
+			types = append(types, m["type"].(string))
+		}
+	}
+	joined := fmt.Sprint(types)
+	if !strings.Contains(joined, "web_search") || !strings.Contains(joined, "code_interpreter") || !strings.Contains(joined, "lookup") {
+		t.Fatalf("tools missing matrix builtins: %#v", types)
 	}
 }
 
