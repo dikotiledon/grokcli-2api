@@ -176,8 +176,8 @@ def main() -> int:
     try:
         img = os.environ.get("VISION_IMAGE_URL")
         if not img:
-            # 1x1 transparent PNG — may be rejected if min 512px enforced upstream.
-            img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            # 32x32 solid red PNG (1024px, above upstream min 512px)
+            img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAANUlEQVR4nO3QsQ0AMAzDsLT//9yeoCkbeYAN6LzZdZf3x0GSKEmUJEoSJYmSREmiJFGSaMoHo8QBPwYSAhsAAAAASUVORK5CYII="
         r = client.chat_vision("What color is this image? One word.", img, max_tokens=32, reasoning_effort="low")
         record("Vision", bool(r.content or r.finish_reason or r.id), r.content[:120])
     except Exception as e:
