@@ -667,6 +667,12 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 	if len(keys) > 0 {
 		r = r.WithContext(withShellArgKeys(r.Context(), keys))
 	}
+	// Path-schema agents (Hermes write_file/read_file, OpenClaw, generic OpenAI tools)
+	// declare "path"; Claude Code uses "file_path". Capture preferred keys before sanitize.
+	pathKeys := toolcall.PathArgKeyMap(chatReq.Raw["tools"])
+	if len(pathKeys) > 0 {
+		r = r.WithContext(withPathArgKeys(r.Context(), pathKeys))
+	}
 	// Client-registered tools for Update/StrReplace → Edit remap on chat path.
 	if allowed := allowedAnthropicToolNames(chatReq.Raw); len(allowed) > 0 {
 		r = r.WithContext(withAllowedTools(r.Context(), allowed))
@@ -930,6 +936,7 @@ func streamChatCompletions(w http.ResponseWriter, r *http.Request, body io.Reade
 	assembler := proxy.NewChatToolStreamAssembler()
 	// Project shell args to client schema (Codex: cmd) using keys from serveChatCompletions.
 	assembler.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+	assembler.SetPathArgKeys(pathArgKeysFrom(r.Context()))
 	// Remap Grok Update/StrReplace → client Edit when tools are known.
 	assembler.SetAllowedTools(allowedToolNamesFrom(r.Context()))
 	// Soft client write/ctx blips must NOT abort ReadSSE: aborting drains the
@@ -2029,6 +2036,23 @@ func shellArgKeysFrom(ctx context.Context) map[string]string {
 	return v
 }
 
+type pathArgKeysContextKey struct{}
+
+func withPathArgKeys(ctx context.Context, keys map[string]string) context.Context {
+	if len(keys) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, pathArgKeysContextKey{}, keys)
+}
+
+func pathArgKeysFrom(ctx context.Context) map[string]string {
+	if ctx == nil {
+		return nil
+	}
+	v, _ := ctx.Value(pathArgKeysContextKey{}).(map[string]string)
+	return v
+}
+
 type allowedToolsContextKey struct{}
 
 func withAllowedTools(ctx context.Context, names []string) context.Context {
@@ -2194,6 +2218,10 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	if len(keys) > 0 {
 		r = r.WithContext(withShellArgKeys(r.Context(), keys))
+	}
+	pathKeys := toolcall.PathArgKeyMap(raw["tools"])
+	if len(pathKeys) > 0 {
+		r = r.WithContext(withPathArgKeys(r.Context(), pathKeys))
 	}
 	clampCodexReasoning(raw, body, r.UserAgent(), options.runtimeConfig().CodexForceReasoningLow)
 	messages, _ := body["messages"].([]map[string]any)
@@ -2365,6 +2393,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		w.WriteHeader(http.StatusOK)
 		early := responses.NewLiveStreamerWithMaxTools(responseID, model, allowedResponsesToolNames(body), respPolicy.MaxTools)
 		early.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+		early.SetPathArgKeys(pathArgKeysFrom(r.Context()))
 		early.SetCustomToolNames(customToolNames)
 		for _, frame := range early.Start() {
 			_, _ = w.Write([]byte(frame))
@@ -2475,6 +2504,7 @@ func streamOpenAIResponses(w http.ResponseWriter, r *http.Request, body io.Reade
 	}
 	streamer := responses.NewLiveStreamerWithMaxTools(responseID, model, allowed, maxTools)
 	streamer.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+	streamer.SetPathArgKeys(pathArgKeysFrom(r.Context()))
 	return runOpenAIResponsesStream(w, r, body, streamer, keepalive, maxTools, false, len(allowed) > 0)
 }
 

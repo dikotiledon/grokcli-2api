@@ -831,6 +831,29 @@ func preferredShellArgKey(name string, keys map[string]string) string {
 	return ""
 }
 
+// preferredPathArgKey resolves the client-facing path arg name for a tool.
+// Schema map (from PathArgKeyMap) wins; otherwise DefaultPathArgKey.
+func preferredPathArgKey(name string, keys map[string]string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if keys != nil {
+		if v := strings.TrimSpace(keys[name]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(keys[strings.ToLower(name)]); v != "" {
+			return v
+		}
+		if nk := toolcall.NameKey(name); nk != "" {
+			if v := strings.TrimSpace(keys[nk]); v != "" {
+				return v
+			}
+		}
+	}
+	return toolcall.DefaultPathArgKey(name)
+}
+
 // extractAllowedToolNames collects client-registered tool names from OpenAI or
 // Anthropic-shaped tools arrays. Used to remap Grok Update/StrReplace → Edit.
 func extractAllowedToolNames(raw map[string]any) []string {
@@ -875,10 +898,15 @@ func extractAllowedToolNames(raw map[string]any) []string {
 // allowedNames remaps Grok-invented Update/StrReplace → client Edit (Claude Code
 // via sub2api / OpenAI chat). Empty allowed still remaps edit aliases to "Edit".
 func normalizeOutboundToolCalls(calls []map[string]any, shellArgKeys map[string]string, force bool, allowedNames ...[]string) []map[string]any {
+	return normalizeOutboundToolCallsWithPath(calls, shellArgKeys, nil, force, allowedNames...)
+}
+
+func normalizeOutboundToolCallsWithPath(calls []map[string]any, shellArgKeys, pathArgKeys map[string]string, force bool, allowedNames ...[]string) []map[string]any {
 	if len(calls) == 0 {
 		return nil
 	}
 	keys := shellArgKeys
+	pathKeys := pathArgKeys
 	var allowed []string
 	if len(allowedNames) > 0 {
 		allowed = allowedNames[0]
@@ -972,6 +1000,12 @@ func normalizeOutboundToolCalls(calls []map[string]any, shellArgKeys map[string]
 		} else if pref := preferredShellArgKey(rawName, keys); pref != "" {
 			args = toolcall.ProjectShellArgsForClient(args, rawName, pref)
 		}
+		// Agent-agnostic path projection: internal file_path → client "path" when schema says so.
+		if pref := preferredPathArgKey(name, pathKeys); pref != "" {
+			args = toolcall.ProjectPathArgsForClient(args, name, pref)
+		} else if pref := preferredPathArgKey(rawName, pathKeys); pref != "" {
+			args = toolcall.ProjectPathArgsForClient(args, rawName, pref)
+		}
 		id := strings.TrimSpace(stringValueAny(item["id"]))
 		if id == "" {
 			id = fmt.Sprintf("call_go_%d", i)
@@ -1061,12 +1095,14 @@ type ChatToolStreamAssembler struct {
 	// shellArgKeys maps tool name → preferred client shell arg key ("cmd" or "command").
 	// Empty/nil defaults shell-family tools to "cmd" (Codex schema).
 	shellArgKeys map[string]string
+	// pathArgKeys maps tool name → preferred client path arg key ("path" or "file_path").
+	pathArgKeys map[string]string
 	// allowedTools: client-registered names for Update/StrReplace → Edit remap.
 	allowedTools []string
 }
 
 func NewChatToolStreamAssembler() *ChatToolStreamAssembler {
-	return &ChatToolStreamAssembler{emitted: map[int]bool{}, clientAcked: map[int]bool{}, shellArgKeys: map[string]string{}}
+	return &ChatToolStreamAssembler{emitted: map[int]bool{}, clientAcked: map[int]bool{}, shellArgKeys: map[string]string{}, pathArgKeys: map[string]string{}}
 }
 
 // SetShellArgKeys configures client-facing shell parameter names (Codex: "cmd").
@@ -1079,6 +1115,18 @@ func (a *ChatToolStreamAssembler) SetShellArgKeys(keys map[string]string) {
 		return
 	}
 	a.shellArgKeys = keys
+}
+
+// SetPathArgKeys configures client-facing path parameter names (Hermes/OpenAI: "path", Claude: "file_path").
+func (a *ChatToolStreamAssembler) SetPathArgKeys(keys map[string]string) {
+	if a == nil {
+		return
+	}
+	if keys == nil {
+		a.pathArgKeys = map[string]string{}
+		return
+	}
+	a.pathArgKeys = keys
 }
 
 // SetAllowedTools configures client-registered tool names for outbound remap
@@ -1346,7 +1394,7 @@ func (a *ChatToolStreamAssembler) emitReadyToolFrames(force bool) []map[string]a
 	// Force-finish (force=true / non-stream collector): CoerceCompleteJSON fills
 	// delete-match defaults so incomplete path+old still emit at stream end.
 	// Remap Update/StrReplace → Edit using client-registered tool names.
-	normalized := normalizeOutboundToolCalls(a.toolCalls, a.shellArgKeys, force, a.allowedTools)
+	normalized := normalizeOutboundToolCallsWithPath(a.toolCalls, a.shellArgKeys, a.pathArgKeys, force, a.allowedTools)
 	if len(normalized) == 0 && a.functionCall == nil {
 		return nil
 	}

@@ -52,6 +52,7 @@ type LiveStreamer struct {
 	textOut         int // output_index of the open text message item (-1 if none)
 	tools           map[int]*liveTool
 	shellArgKeys    map[string]string
+	pathArgKeys     map[string]string
 	customToolNames map[string]bool
 	// pendingClientAcks: tool indexes framed but not yet Ack'd as written.
 	pendingClientAcks []int
@@ -86,6 +87,7 @@ func NewLiveStreamerWithMaxTools(responseID, model string, allowed []string, max
 		textOut:         -1,
 		tools:           make(map[int]*liveTool),
 		shellArgKeys:    map[string]string{},
+		pathArgKeys:     map[string]string{},
 		customToolNames: map[string]bool{},
 	}
 }
@@ -100,6 +102,18 @@ func (s *LiveStreamer) SetShellArgKeys(keys map[string]string) {
 		return
 	}
 	s.shellArgKeys = keys
+}
+
+// SetPathArgKeys configures client-facing path parameter names ("path" vs "file_path").
+func (s *LiveStreamer) SetPathArgKeys(keys map[string]string) {
+	if s == nil {
+		return
+	}
+	if keys == nil {
+		s.pathArgKeys = map[string]string{}
+		return
+	}
+	s.pathArgKeys = keys
 }
 
 // SetCustomToolNames configures Responses API free-form tools. Internally the
@@ -125,6 +139,7 @@ func (s *LiveStreamer) projectArgs(toolName, args string) string {
 	if s == nil || args == "" {
 		return args
 	}
+	out := args
 	// Prefer client tool schema key when known (Codex: "cmd"; Hermes terminal: "command").
 	// Fall back to DefaultShellArgKey for shell-family tools without a map entry.
 	preferred := ""
@@ -149,14 +164,33 @@ func (s *LiveStreamer) projectArgs(toolName, args string) string {
 			// Unknown/custom tool name but payload looks like a shell call —
 			// Codex is the common case that needs cmd projection.
 			preferred = "cmd"
-		} else {
-			return args
 		}
 	}
-	out := toolcall.ProjectShellArgsForClient(args, toolName, preferred)
-	// Final safety: if we preferred cmd but output still only has command, force rewrite.
-	if preferred == "cmd" && strings.Contains(out, `"command"`) && !strings.Contains(out, `"cmd"`) {
-		out = toolcall.ProjectShellArgsForClient(out, "shell", "cmd")
+	if preferred != "" {
+		out = toolcall.ProjectShellArgsForClient(out, toolName, preferred)
+		// Final safety: if we preferred cmd but output still only has command, force rewrite.
+		if preferred == "cmd" && strings.Contains(out, `"command"`) && !strings.Contains(out, `"cmd"`) {
+			out = toolcall.ProjectShellArgsForClient(out, "shell", "cmd")
+		}
+	}
+	// Agent-agnostic path projection: internal file_path → client "path" when schema says so.
+	pathPref := ""
+	if s.pathArgKeys != nil {
+		if v := strings.TrimSpace(s.pathArgKeys[toolName]); v != "" {
+			pathPref = v
+		} else if v := strings.TrimSpace(s.pathArgKeys[strings.ToLower(toolName)]); v != "" {
+			pathPref = v
+		} else if nk := toolcall.NameKey(toolName); nk != "" {
+			if v := strings.TrimSpace(s.pathArgKeys[nk]); v != "" {
+				pathPref = v
+			}
+		}
+	}
+	if pathPref == "" {
+		pathPref = toolcall.DefaultPathArgKey(toolName)
+	}
+	if pathPref == "path" || (s.pathArgKeys != nil && pathPref != "") {
+		out = toolcall.ProjectPathArgsForClient(out, toolName, pathPref)
 	}
 	return out
 }

@@ -19,6 +19,17 @@ var nonName = regexp.MustCompile(`[^a-z0-9_]+`)
 var required = map[string][]string{
 	"read":          {"file_path"},
 	"write":         {"file_path", "content"},
+	// Path-schema agents (Hermes / OpenClaw / generic OpenAI tools): internal
+	// normalize aliases path→file_path; outbound ProjectPathArgsForClient remaps.
+	"read_file":     {"file_path"},
+	"write_file":    {"file_path", "content"},
+	"readfile":      {"file_path"},
+	"writefile":     {"file_path", "content"},
+	"create_file":   {"file_path", "content"},
+	"createfile":    {"file_path", "content"},
+	"patch":         {"file_path", "old_string", "new_string"},
+	"search_files":  {"pattern"},
+	"searchfiles":   {"pattern"},
 	"edit":          {"file_path", "old_string", "new_string"},
 	"update":        {"file_path", "old_string", "new_string"},
 	"strreplace":    {"file_path", "old_string", "new_string"},
@@ -3281,6 +3292,233 @@ func truncateForLog(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+
+// ---------------------------------------------------------------------------
+// Path-arg projection (agent-agnostic)
+//
+// Many agent stacks declare file tools with "path" (Hermes write_file/read_file,
+// OpenClaw, generic OpenAI tools). Claude Code / Cursor use "file_path".
+// Internal normalize always canonicalizes to file_path so Grok aliases work.
+// Before returning tool_calls to the client, project back to the key the
+// client's tool schema actually declared — same pattern as shell cmd/command.
+// ---------------------------------------------------------------------------
+
+// PreferredPathArgKey inspects a tool parameters schema and returns the
+// client-facing path field name: "path" or "file_path".
+// Default "file_path" preserves Claude Code / Cursor behavior when schema is absent.
+func PreferredPathArgKey(parameters any) string {
+	params, _ := parameters.(map[string]any)
+	if params == nil {
+		return "file_path"
+	}
+	props, _ := params["properties"].(map[string]any)
+	req, _ := params["required"].([]any)
+	has := func(name string) bool {
+		if props != nil {
+			if _, ok := props[name]; ok {
+				return true
+			}
+		}
+		for _, item := range req {
+			if strings.EqualFold(strings.TrimSpace(fmt.Sprint(item)), name) {
+				return true
+			}
+		}
+		return false
+	}
+	// Exclusive schema wins.
+	if has("path") && !has("file_path") {
+		return "path"
+	}
+	if has("file_path") && !has("path") {
+		return "file_path"
+	}
+	// Both present: prefer required list order.
+	for _, item := range req {
+		key := strings.ToLower(strings.TrimSpace(fmt.Sprint(item)))
+		if key == "path" || key == "file_path" {
+			return key
+		}
+	}
+	if has("path") {
+		return "path"
+	}
+	return "file_path"
+}
+
+// PreferredPathArgKeyFromTool extracts preferred path key from a tool object.
+func PreferredPathArgKeyFromTool(tool map[string]any) string {
+	if tool == nil {
+		return "file_path"
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		return PreferredPathArgKey(firstNonNil(fn["parameters"], fn["input_schema"], tool["parameters"], tool["input_schema"]))
+	}
+	return PreferredPathArgKey(firstNonNil(tool["parameters"], tool["input_schema"]))
+}
+
+// toolLooksLikePathTool is true when the schema mentions a path-like property
+// or the tool name is a known file tool. Used to populate PathArgKeyMap without
+// projecting every random tool.
+func toolLooksLikePathTool(name string, tool map[string]any) bool {
+	key := nameKey(name)
+	switch key {
+	case "read", "write", "edit", "update", "strreplace", "str_replace", "replace",
+		"multiedit", "notebookedit",
+		"readfile", "writefile", "createfile", "deletefile", "removefile",
+		"read_file", "write_file", "create_file", "delete_file", "remove_file",
+		"patch", "applypatch", "apply_patch",
+		"searchfiles", "search_files", "listfiles", "list_files",
+		"open", "save", "load":
+		return true
+	}
+	if strings.Contains(key, "file") || strings.HasSuffix(key, "edit") || strings.HasSuffix(key, "write") || strings.HasSuffix(key, "read") {
+		// Avoid shell/task false positives handled elsewhere.
+		if isShellTool(name) || protectedNames[key] {
+			return false
+		}
+		return true
+	}
+	// Schema-driven: properties/required include path or file_path.
+	var params any
+	if tool != nil {
+		if fn, ok := tool["function"].(map[string]any); ok {
+			params = firstNonNil(fn["parameters"], fn["input_schema"], tool["parameters"], tool["input_schema"])
+		} else {
+			params = firstNonNil(tool["parameters"], tool["input_schema"])
+		}
+	}
+	p, _ := params.(map[string]any)
+	if p == nil {
+		return false
+	}
+	props, _ := p["properties"].(map[string]any)
+	if props != nil {
+		if _, ok := props["path"]; ok {
+			return true
+		}
+		if _, ok := props["file_path"]; ok {
+			return true
+		}
+	}
+	if req, ok := p["required"].([]any); ok {
+		for _, item := range req {
+			k := strings.ToLower(strings.TrimSpace(fmt.Sprint(item)))
+			if k == "path" || k == "file_path" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PathArgKeyMap builds tool-name → preferred path arg key from a tools array.
+// Only tools that look path-related are included.
+func PathArgKeyMap(tools any) map[string]string {
+	out := map[string]string{}
+	items, ok := tools.([]any)
+	if !ok {
+		return out
+	}
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := ""
+		if fn, ok := tool["function"].(map[string]any); ok {
+			name = strings.TrimSpace(fmt.Sprint(fn["name"]))
+		}
+		if name == "" {
+			name = strings.TrimSpace(fmt.Sprint(tool["name"]))
+		}
+		if name == "" || !toolLooksLikePathTool(name, tool) {
+			continue
+		}
+		pref := PreferredPathArgKeyFromTool(tool)
+		out[name] = pref
+		out[strings.ToLower(name)] = pref
+		if nk := nameKey(name); nk != "" {
+			out[nk] = pref
+		}
+	}
+	return out
+}
+
+// DefaultPathArgKey returns the client-facing path parameter when no schema map
+// entry exists. Unknown tools keep Claude Code "file_path"; known path-schema
+// agent tools default to "path".
+func DefaultPathArgKey(name string) string {
+	key := nameKey(name)
+	switch key {
+	case "readfile", "writefile", "createfile", "deletefile", "removefile",
+		"read_file", "write_file", "create_file", "delete_file", "remove_file",
+		"searchfiles", "search_files", "listfiles", "list_files",
+		"patch":
+		return "path"
+	default:
+		return "file_path"
+	}
+}
+
+// ProjectPathArgsForClient rewrites internal file_path (and aliases) onto the
+// client-declared path key. Non-path tools / empty preferredKey are no-ops
+// except when DefaultPathArgKey(toolName) is "path".
+func ProjectPathArgsForClient(argsJSON, toolName, preferredKey string) string {
+	preferredKey = strings.TrimSpace(preferredKey)
+	if preferredKey == "" {
+		preferredKey = DefaultPathArgKey(toolName)
+	}
+	// Only remap when client wants "path". file_path is already internal form.
+	if preferredKey != "path" {
+		return argsJSON
+	}
+	text := strings.TrimSpace(argsJSON)
+	if text == "" {
+		return argsJSON
+	}
+	// Normalize under a Claude-style name so path→file_path aliases apply, then project out.
+	normalized := NormalizeJSON(text, "write")
+	if strings.TrimSpace(normalized) == "" {
+		normalized = text
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(normalized), &obj); err != nil {
+		if err2 := json.Unmarshal([]byte(text), &obj); err2 != nil {
+			return argsJSON
+		}
+	}
+	// Collect path value from file_path or any known alias still present.
+	var val any
+	for _, k := range []string{"file_path", "path", "filepath", "file", "filename", "target_file", "targetfile", "target_path", "target"} {
+		if v, ok := obj[k]; ok && !empty(v) {
+			val = unwrapPathValue(v)
+			break
+		}
+	}
+	if val == nil {
+		// Nothing to project; return normalized/internal.
+		return normalized
+	}
+	// Rebuild: preferred path key first, drop file_path aliases, keep other fields.
+	out := map[string]any{"path": val}
+	for k, v := range obj {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		switch lk {
+		case "file_path", "path", "filepath", "file", "filename", "file_name",
+			"target_file", "targetfile", "target_path", "targetpath", "target":
+			continue
+		default:
+			out[k] = v
+		}
+	}
+	encoded, err := compactJSON(out)
+	if err != nil {
+		return argsJSON
+	}
+	return encoded
 }
 
 // Codex shell outbound policy (cache-safe):
