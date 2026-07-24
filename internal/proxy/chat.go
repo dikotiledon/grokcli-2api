@@ -61,10 +61,11 @@ type AffinityStore interface {
 }
 
 type ChatRequest struct {
-	Model     string         `json:"model"`
-	Stream    bool           `json:"stream"`
-	Raw       map[string]any `json:"-"`
-	UserAgent string         `json:"-"` // optional; Codex auto-compact threshold
+	Model      string         `json:"model"`
+	Stream     bool           `json:"stream"`
+	Raw        map[string]any `json:"-"`
+	UserAgent  string         `json:"-"` // optional; Codex auto-compact threshold
+	PathArgKeys map[string]string `json:"-"` // client tool schema path keys
 }
 
 type StreamFrame struct {
@@ -190,6 +191,7 @@ func (s *ChatService) CompleteWithResult(ctx context.Context, request ChatReques
 		}
 		collector := newChatCollector(model)
 		collector.SetAllowedTools(extractAllowedToolNames(request.Raw))
+		collector.SetPathArgKeys(request.PathArgKeys)
 		readErr := grok.ReadSSE(attempt.Body, collector.feed)
 		_ = attempt.Body.Close()
 		if readErr != nil {
@@ -696,6 +698,8 @@ type chatCollector struct {
 	created      int64
 	// allowedTools: client-registered names for Update/StrReplace → Edit remap.
 	allowedTools []string
+	// pathArgKeys: client-facing path arg keys ("path" vs "file_path").
+	pathArgKeys  map[string]string
 }
 
 func newChatCollector(model string) *chatCollector {
@@ -708,6 +712,18 @@ func (c *chatCollector) SetAllowedTools(names []string) {
 		return
 	}
 	c.allowedTools = append([]string(nil), names...)
+}
+
+// SetPathArgKeys configures client-facing path parameter names.
+func (c *chatCollector) SetPathArgKeys(keys map[string]string) {
+	if c == nil {
+		return
+	}
+	if keys == nil {
+		c.pathArgKeys = map[string]string{}
+		return
+	}
+	c.pathArgKeys = keys
 }
 
 func (c *chatCollector) feed(event grok.Event) error {
@@ -759,7 +775,7 @@ func (c *chatCollector) response() map[string]any {
 	// Normalize + drop incomplete tool calls so OpenAI clients never receive
 	// alias-only / half-JSON arguments that break tool loops.
 	// Remap Update/StrReplace → Edit using client-registered tool names.
-	toolCalls := normalizeOutboundToolCalls(c.toolCalls, nil, true, c.allowedTools)
+	toolCalls := normalizeOutboundToolCallsWithPath(c.toolCalls, nil, c.pathArgKeys, true, c.allowedTools)
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 		// OpenAI chat: tool messages require content=null when tool_calls present.

@@ -318,3 +318,42 @@ func TestToolResultMultiTurn(t *testing.T) {
 		t.Fatalf("upstream did not receive tool result: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+
+// TestPathSchemaResponsesNonStream verifies path projection works on the
+// /v1/responses non-streaming path (used by OpenCode, VSCode Copilot).
+func TestPathSchemaResponsesNonStream(t *testing.T) {
+	upstream := httptest.NewServer(fakeUpstreamToolCall(t, "write_file", `{"file_path":"/tmp/demo.txt","content":"hello"}`))
+	defer upstream.Close()
+
+	h := server.NewMux(server.Options{
+		Ready:            func() bool { return true },
+		ResponsesEnabled: true,
+		APIKeys:          auth.NewAPIKeyVerifier(config.Config{LegacyAPIKey: "secret"}, nil),
+		Candidates:       []pool.Candidate{{ID: "acc", Token: "tok", Enabled: true}},
+		Config: config.Config{
+			UpstreamBase: upstream.URL + "/v1",
+			DefaultModel: "grok-4.5",
+			SSEKeepalive:  4 * time.Second,
+		},
+	})
+
+	tools := `[{"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]`
+	body := `{"model":"grok-4.5","tools":` + tools + `,"input":[{"role":"user","content":"write a file"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	out := rec.Body.String()
+	// Must have "path" key in the arguments, not "file_path".
+	// Arguments are JSON-encoded as a string inside the response, so check both forms.
+	if !strings.Contains(out, `"path"`) && !strings.Contains(out, `\"path\"`) {
+		t.Fatalf("path-schema agent did not receive path key in responses:\n%s", out)
+	}
+	if strings.Contains(out, `"file_path"`) || strings.Contains(out, `\"file_path\"`) {
+		t.Fatalf("file_path leaked to path-schema agent in responses:\n%s", out)
+	}
+}

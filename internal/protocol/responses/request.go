@@ -435,6 +435,21 @@ func NewResponseID() string {
 	return fmt.Sprintf("resp_%d", time.Now().UnixNano())
 }
 
+// SanitizeResponseID ensures response IDs from upstream (which may be bare
+// UUIDs or arbitrary strings) are always prefixed with "resp_" so clients
+// that validate the format (OpenCode, OpenAI SDK) don't reject them.
+// If the ID already starts with "resp_", keep it. Otherwise prefix it.
+func SanitizeResponseID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return NewResponseID()
+	}
+	if strings.HasPrefix(id, "resp_") || strings.HasPrefix(id, "chatcmpl_") {
+		return id
+	}
+	return "resp_" + id
+}
+
 func copyIfPresent(dst, src map[string]any, key string) {
 	if value, ok := src[key]; ok && value != nil {
 		dst[key] = value

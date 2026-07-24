@@ -646,6 +646,7 @@ func serveChatCompletions(w http.ResponseWriter, r *http.Request, options Option
 		return
 	}
 	chatReq.UserAgent = r.UserAgent()
+	chatReq.PathArgKeys = pathArgKeysFrom(r.Context())
 
 	// Codex shell schema uses "cmd"; remember preferred keys from the client tools
 	// so outbound tool_calls project command→cmd (or honor pure command-only schemas).
@@ -2229,7 +2230,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		writeOpenAIError(w, http.StatusBadRequest, "input must contain at least one message", "invalid_request_error")
 		return
 	}
-	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body, UserAgent: r.UserAgent()}
+	chatReq := proxy.ChatRequest{Model: model, Stream: stream, Raw: body, UserAgent: r.UserAgent(), PathArgKeys: pathArgKeysFrom(r.Context())}
 	// Sticky keys for Codex multi-turn: prompt_cache_key first, then previous_response_id chain.
 	// CRITICAL: never mint a *new* pck each turn from previous_response_id — that kills upstream
 	// prompt cache. Always recover the same pck that produced the previous response when possible.
@@ -2460,7 +2461,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	if pck != "" {
 		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
 	}
-	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls, shellArgKeysFrom(r.Context()), customToolNames), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
+	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls, shellArgKeysFrom(r.Context()), customToolNames, pathArgKeysFrom(r.Context())), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
 }
 
 // effectiveResponsesKeepalive tightens SSE keepalive for tool-heavy Codex turns
@@ -2782,9 +2783,12 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 	}()
 }
 
-func responseToolCalls(calls []anthropic.ToolCall, keys map[string]string, customToolNames map[string]bool) []map[string]any {
+func responseToolCalls(calls []anthropic.ToolCall, keys map[string]string, customToolNames map[string]bool, pathKeys map[string]string) []map[string]any {
 	if keys == nil {
 		keys = map[string]string{}
+	}
+	if pathKeys == nil {
+		pathKeys = map[string]string{}
 	}
 	out := make([]map[string]any, 0, len(calls))
 	for _, call := range calls {
@@ -2804,6 +2808,23 @@ func responseToolCalls(calls []anthropic.ToolCall, keys map[string]string, custo
 				}
 			}
 			args = toolcall.ProjectShellArgsForClient(args, name, preferred)
+		}
+		// Agent-agnostic path projection: internal file_path → client "path" when schema says so.
+		pathPref := ""
+		if v := strings.TrimSpace(pathKeys[name]); v != "" {
+			pathPref = v
+		} else if v := strings.TrimSpace(pathKeys[strings.ToLower(name)]); v != "" {
+			pathPref = v
+		} else if nk := toolcall.NameKey(name); nk != "" {
+			if v := strings.TrimSpace(pathKeys[nk]); v != "" {
+				pathPref = v
+			}
+		}
+		if pathPref == "" {
+			pathPref = toolcall.DefaultPathArgKey(name)
+		}
+		if pathPref != "" {
+			args = toolcall.ProjectPathArgsForClient(args, name, pathPref)
 		}
 		item := map[string]any{
 			"id":   call.ID,
