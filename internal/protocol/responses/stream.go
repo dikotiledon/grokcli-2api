@@ -189,7 +189,8 @@ func (s *LiveStreamer) projectArgs(toolName, args string) string {
 	if pathPref == "" {
 		pathPref = toolcall.DefaultPathArgKey(toolName)
 	}
-	if pathPref == "path" || (s.pathArgKeys != nil && pathPref != "") {
+	// Project whenever client wants anything other than internal "file_path".
+	if pathPref != "file_path" {
 		out = toolcall.ProjectPathArgsForClient(out, toolName, pathPref)
 	}
 	return out

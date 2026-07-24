@@ -135,3 +135,83 @@ func TestProjectPathArgsFromGrokPathAlias(t *testing.T) {
 		t.Fatalf("file_path leaked: %s", out)
 	}
 }
+
+
+// TestPreferredPathArgKeyCamelCase verifies camelCase variants are detected.
+func TestPreferredPathArgKeyCamelCase(t *testing.T) {
+	// OpenCode/Cursor: filePath (camelCase)
+	if got := PreferredPathArgKey(map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"filePath": map[string]any{"type": "string"}, "content": map[string]any{"type": "string"}},
+		"required":   []any{"filePath", "content"},
+	}); got != "filePath" {
+		t.Fatalf("camelCase filePath → %q", got)
+	}
+	// Mixed: both path and filePath present, required has filePath first
+	if got := PreferredPathArgKey(map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"path": map[string]any{"type": "string"}, "filePath": map[string]any{"type": "string"}},
+		"required":   []any{"filePath"},
+	}); got != "filePath" {
+		t.Fatalf("required filePath should win → %q", got)
+	}
+}
+
+// TestProjectPathArgsForClientFilePath projects to camelCase filePath.
+func TestProjectPathArgsForClientFilePath(t *testing.T) {
+	internal := `{"file_path":"C:/tmp/test.go","content":"x"}`
+	out := ProjectPathArgsForClient(internal, "write", "filePath")
+	if !strings.Contains(out, `"filePath"`) {
+		t.Fatalf("expected filePath key: %s", out)
+	}
+	if strings.Contains(out, `"file_path"`) {
+		t.Fatalf("file_path leaked: %s", out)
+	}
+	if !strings.Contains(out, "C:/tmp/test.go") {
+		t.Fatalf("path value lost: %s", out)
+	}
+}
+
+// TestProjectPathArgsForClientFilePathLower projects to lowercase filepath.
+func TestProjectPathArgsForClientFilePathLower(t *testing.T) {
+	internal := `{"file_path":"/tmp/a.go","content":"y"}`
+	out := ProjectPathArgsForClient(internal, "write", "filepath")
+	if !strings.Contains(out, `"filepath"`) {
+		t.Fatalf("expected filepath key: %s", out)
+	}
+	if strings.Contains(out, `"file_path"`) {
+		t.Fatalf("file_path leaked: %s", out)
+	}
+}
+
+// TestProjectPathArgsForClientGrokEmitsCamelCase handles Grok emitting filePath
+// directly (not just file_path).
+func TestProjectPathArgsForClientGrokEmitsCamelCase(t *testing.T) {
+	// Grok might emit any variant; internal normalize maps them all to file_path.
+	// But if normalize hasn't run yet, ProjectPathArgsForClient should still find it.
+	raw := `{"filePath":"/tmp/b.go","content":"z"}`
+	out := ProjectPathArgsForClient(raw, "write", "filePath")
+	if !strings.Contains(out, `"filePath"`) {
+		t.Fatalf("expected filePath preserved: %s", out)
+	}
+	if !strings.Contains(out, "/tmp/b.go") {
+		t.Fatalf("path value lost: %s", out)
+	}
+}
+
+// TestProjectPathArgsForClientFilePathFromGrokPathAlias handles Grok emitting
+// "path" when the client wants "filePath".
+func TestProjectPathArgsForClientFilePathFromGrokPathAlias(t *testing.T) {
+	raw := `{"path":"D:/work/c.go","content":"w"}`
+	norm := NormalizeJSON(raw, "write_file")
+	out := ProjectPathArgsForClient(norm, "write_file", "filePath")
+	if !strings.Contains(out, `"filePath"`) {
+		t.Fatalf("expected filePath from path alias: norm=%s out=%s", norm, out)
+	}
+	if strings.Contains(out, `"file_path"`) || strings.Contains(out, `"path"`) {
+		t.Fatalf("old path key leaked: %s", out)
+	}
+	if !strings.Contains(out, "D:/work/c.go") {
+		t.Fatalf("path value lost: %s", out)
+	}
+}

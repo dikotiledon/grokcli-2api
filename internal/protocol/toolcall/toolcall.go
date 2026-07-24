@@ -3305,9 +3305,21 @@ func truncateForLog(s string, n int) string {
 // client's tool schema actually declared — same pattern as shell cmd/command.
 // ---------------------------------------------------------------------------
 
+// pathLikeKeys is the set of property names that agents use for file paths.
+// The proxy normalizes all of these to internal "file_path", then projects
+// back to the EXACT key the client schema declared.
+var pathLikeKeys = []string{
+	"file_path", "filepath", "filePath", "FilePath",
+	"file", "filename", "fileName", "file_name", "FileName",
+	"path", "Path",
+	"target_file", "targetfile", "targetFile", "targetFile",
+	"target_path", "targetpath", "targetPath", "targetPath",
+	"target",
+}
+
 // PreferredPathArgKey inspects a tool parameters schema and returns the
-// client-facing path field name: "path" or "file_path".
-// Default "file_path" preserves Claude Code / Cursor behavior when schema is absent.
+// EXACT client-facing path field name the schema declares. Returns "file_path"
+// as default when no path-like property is found (Claude Code compatible).
 func PreferredPathArgKey(parameters any) string {
 	params, _ := parameters.(map[string]any)
 	if params == nil {
@@ -3328,22 +3340,27 @@ func PreferredPathArgKey(parameters any) string {
 		}
 		return false
 	}
-	// Exclusive schema wins.
-	if has("path") && !has("file_path") {
-		return "path"
-	}
-	if has("file_path") && !has("path") {
-		return "file_path"
-	}
-	// Both present: prefer required list order.
+	// Check required list first — the first path-like key in required[] wins.
 	for _, item := range req {
-		key := strings.ToLower(strings.TrimSpace(fmt.Sprint(item)))
-		if key == "path" || key == "file_path" {
-			return key
+		key := strings.TrimSpace(fmt.Sprint(item))
+		for _, lk := range pathLikeKeys {
+			if key == lk {
+				return key
+			}
+		}
+		// Case-insensitive fallback for unusual variants.
+		lower := strings.ToLower(key)
+		for _, lk := range pathLikeKeys {
+			if lower == strings.ToLower(lk) {
+				return key // preserve original casing
+			}
 		}
 	}
-	if has("path") {
-		return "path"
+	// Check properties — first path-like key found.
+	for _, lk := range pathLikeKeys {
+		if has(lk) {
+			return lk
+		}
 	}
 	return "file_path"
 }
@@ -3381,7 +3398,7 @@ func toolLooksLikePathTool(name string, tool map[string]any) bool {
 		}
 		return true
 	}
-	// Schema-driven: properties/required include path or file_path.
+	// Schema-driven: properties/required include any path-like key.
 	var params any
 	if tool != nil {
 		if fn, ok := tool["function"].(map[string]any); ok {
@@ -3396,11 +3413,10 @@ func toolLooksLikePathTool(name string, tool map[string]any) bool {
 	}
 	props, _ := p["properties"].(map[string]any)
 	if props != nil {
-		if _, ok := props["path"]; ok {
-			return true
-		}
-		if _, ok := props["file_path"]; ok {
-			return true
+		for _, lk := range pathLikeKeys {
+			if _, ok := props[lk]; ok {
+				return true
+			}
 		}
 	}
 	if req, ok := p["required"].([]any); ok {
@@ -3464,15 +3480,15 @@ func DefaultPathArgKey(name string) string {
 }
 
 // ProjectPathArgsForClient rewrites internal file_path (and aliases) onto the
-// client-declared path key. Non-path tools / empty preferredKey are no-ops
-// except when DefaultPathArgKey(toolName) is "path".
+// client-declared path key. Supports any path-like key (path, file_path, filePath, etc.).
+// When preferredKey matches internal "file_path", no rewrite is needed.
 func ProjectPathArgsForClient(argsJSON, toolName, preferredKey string) string {
 	preferredKey = strings.TrimSpace(preferredKey)
 	if preferredKey == "" {
 		preferredKey = DefaultPathArgKey(toolName)
 	}
-	// Only remap when client wants "path". file_path is already internal form.
-	if preferredKey != "path" {
+	// If client wants "file_path", that's already the internal form — no rewrite needed.
+	if preferredKey == "file_path" {
 		return argsJSON
 	}
 	text := strings.TrimSpace(argsJSON)
@@ -3492,7 +3508,7 @@ func ProjectPathArgsForClient(argsJSON, toolName, preferredKey string) string {
 	}
 	// Collect path value from file_path or any known alias still present.
 	var val any
-	for _, k := range []string{"file_path", "path", "filepath", "file", "filename", "target_file", "targetfile", "target_path", "target"} {
+	for _, k := range pathLikeKeys {
 		if v, ok := obj[k]; ok && !empty(v) {
 			val = unwrapPathValue(v)
 			break
@@ -3502,15 +3518,18 @@ func ProjectPathArgsForClient(argsJSON, toolName, preferredKey string) string {
 		// Nothing to project; return normalized/internal.
 		return normalized
 	}
-	// Rebuild: preferred path key first, drop file_path aliases, keep other fields.
-	out := map[string]any{"path": val}
+	// Rebuild: preferred path key + all non-path fields.
+	out := map[string]any{preferredKey: val}
 	for k, v := range obj {
-		lk := strings.ToLower(strings.TrimSpace(k))
-		switch lk {
-		case "file_path", "path", "filepath", "file", "filename", "file_name",
-			"target_file", "targetfile", "target_path", "targetpath", "target":
-			continue
-		default:
+		// Skip any path-like key (case-insensitive) — only keep non-path fields.
+		isPathLike := false
+		for _, lk := range pathLikeKeys {
+			if strings.EqualFold(k, lk) {
+				isPathLike = true
+				break
+			}
+		}
+		if !isPathLike {
 			out[k] = v
 		}
 	}
